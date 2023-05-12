@@ -1,0 +1,194 @@
+public class PaymentService {
+    
+    /** Create test payments in the stripe
+* @param set of payments ID=Trigger.newMap.keySet()
+* @author Natallia
+*/
+    
+    @future (callout = true)
+    public static void makePayment(Set<Id> paymentsId){
+        List<Payment__c> paymentNewList=[SELECT Id,Name,CreatedDate, Tenant__r.Name,Tenant__r.Id, Amount__c, Expiration_date__c, 
+                                         CVV__c, Credit_card_number__c FROM Payment__c where id in :paymentsId];
+        
+        // Set up the HTTP request to create a test token 
+        
+        for (Payment__c payment:paymentNewList){
+            HttpRequest tokenReq = new HttpRequest(); 
+            tokenReq.setEndpoint('https://api.stripe.com/v1/tokens');
+            tokenReq.setMethod('POST'); 
+            tokenReq.setHeader('Authorization','Bearer sk_test_51MvTjcCQTHEaEYj0t56OfmDIDZnTZHmPLBGsGmFtn03CGwzVvzN9v5xBPbKXX3zMFr3k2agLam99WaDOTbVpRLSe009WTrjFxY');
+            tokenReq.setHeader('Content-Type', 'application/x-www-form-urlencoded'); 
+            Date exp=payment.Expiration_date__c;
+            Integer month=exp.month();
+            Integer year=exp.year();
+            String tokenRequestBody = 'card[number]='+payment.Credit_card_number__c
+                +'&card[exp_month]='+month+'&card[exp_year]='+year+'&card[cvc]='+payment.CVV__c;
+            tokenReq.setBody(tokenRequestBody); 
+            
+            // Send the request and get the token ID from the response 
+            
+            Http http = new Http();
+            HttpResponse tokenRes = http.send(tokenReq);
+            Map<String, Object> tokenResponseMap = (Map<String, Object>)
+                JSON.deserializeUntyped(tokenRes.getBody()); 
+            String tokenId = (String) tokenResponseMap.get('id');  
+            
+            // Set up the HTTP request to make a payment with the test token 
+            
+            HttpRequest paymentReq = new HttpRequest(); 
+            paymentReq.setEndpoint('https://api.stripe.com/v1/charges'); 
+            paymentReq.setMethod('POST'); 
+            paymentReq.setHeader('Authorization',
+                                 'Bearer sk_test_51MvTjcCQTHEaEYj0t56OfmDIDZnTZHmPLBGsGmFtn03CGwzVvzN9v5xBPbKXX3zMFr3k2agLam99WaDOTbVpRLSe009WTrjFxY'); 
+            paymentReq.setHeader('Content-Type', 'application/x-www-form-urlencoded');
+            Integer amountInt=(Integer) payment.Amount__c*100;
+            String paymentRequestBody = 'amount='+amountInt+
+                '&currency=usd&description='+payment.Tenant__r.Name+'&source=' + tokenId; 
+            paymentReq.setBody(paymentRequestBody); 
+            
+            
+            // Send the request and handle the response 
+            
+            HttpResponse paymentRes = http.send(paymentReq);
+            if (paymentRes.getStatusCode() == 200) { 
+                System.debug('Payment successful'); 
+                Map <String, Object> result= ( Map <String, Object>)JSON.deserializeUntyped(paymentRes.getBody());
+                String tr=(String) result.get('balance_transaction');
+                String linkRec=(String) result.get('receipt_url');
+                
+                UploadPdfToTenant(linkRec, payment.Tenant__r.Id, tr);
+                
+                UpdateTenantDueAmount(payment.Id,tr,linkRec, payment.Tenant__r.Id);   
+            } else {   
+                
+                System.debug(paymentRes.getBody()); 
+            }
+        }
+    }
+    
+    /** Convert receipt link to PDF and upload it to tenant object as an attachment
+* @param link to the receipt pdf file, tenantID to which we should attach current file, transaction number
+* @author Natallia
+*/
+    
+    public static void UploadPdfToTenant(String receiptUrl, Id  tenantId, String tranNo){
+        String url = receiptUrl;
+        String apiKey = '610d4edc39bd46d1bd7cc3df26e69286';
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('https://api.pdfshift.io/v2/convert');
+        req.setMethod('POST');
+        req.setHeader('Authorization', 'Basic ' + EncodingUtil.base64Encode(Blob.valueOf(apiKey + ':')));
+        req.setHeader('Content-Type', 'application/json');
+        
+        //req.setBody('{"source": "' + url + '"}');
+        
+        req.setBody('{"source": "' + url + '", "landscape": false, "format": "A4"}');
+        Http http = new Http();
+        HTTPResponse res = http.send(req);
+        if(res.getStatusCode()==200){
+            Blob pdfBlob = res.getBodyAsBlob();
+            
+            // system.debug(pdfBlob);
+            
+            String fileName =tranNo+ '.pdf'; 
+            
+            // Replace with your desired file name
+            
+            ContentVersion cv = new ContentVersion();
+            cv.Title = fileName;
+            cv.PathOnClient = fileName;
+            cv.VersionData = pdfBlob;
+           
+            // Insert the ContentVersion record
+            
+            insert cv;
+            ContentVersion cvv = [SELECT Id, ContentDocumentId FROM ContentVersion WHERE Id = :cv.id];
+            
+            // Create a new ContentDocumentLink record
+            
+            ContentDocumentLink cdl = new ContentDocumentLink();
+            cdl.ContentDocumentId = cvv.ContentDocumentId;
+            cdl.LinkedEntityId = tenantId;
+            
+            // Insert the ContentDocumentLink record
+            
+            insert cdl;
+            
+        }
+        
+    }
+    
+    
+    /** when user selects a user (tenant) and 
+* makes a payment, deduct that amount from the tenant's 
+* overdue amount (update it there)
+* @param paymentID Transaction number, link to the receipt file and tenant ID
+* @author Natallia
+*/
+    public static void  UpdateTenantDueAmount (Id paymentsId, String tranNo, String recLink, Id tenantId){
+        List<Payment__c> paymentNewList = [SELECT Id,Name, CreatedDate, Tenant__c, Amount__c, Expiration_date__c, 
+                                           CVV__c, Credit_card_number__c FROM Payment__c
+                                           where id=:paymentsId];
+        Set <Id> tenantIds = new Set <Id>();
+        for (Payment__c payment:paymentNewList){
+            tenantIds.add (payment.Tenant__c);     
+        }
+        List<Tenant__c> tenantList=[select id, Due_amount__c, Email__c from Tenant__c where id in: tenantIds];
+        for (Tenant__c t: tenantList){
+            if (t.Due_amount__c!=null){
+                for (Payment__c p:paymentNewList){
+                    if (t.id == p.Tenant__c){
+                        t.Due_amount__c = t.Due_amount__c -p.Amount__c;
+                    }  
+                }
+            }
+        }
+        update tenantList;
+        sendPaymentConEmail(paymentNewList,tenantList,tranNo,recLink);
+    }
+    /** send email with payment confirmation
+* @param list of new payments and tenants, transaction number receipt
+* @author Natallia
+*/
+    
+    public static void sendPaymentConEmail(List<Payment__c> pList, List<Tenant__c> tList, String transactionNo, String receiptLink){
+        List<Messaging.SingleEmailMessage> emailList = new List<Messaging.SingleEmailMessage>();
+        for (Tenant__c tt:tList){
+            for (Payment__c pp: pList){
+                if (tt.id==pp.tenant__c){
+                    List<String> address = new List<String>();
+                    address.add (tt.Email__c); 
+                    Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
+                    mail.setSubject('Payment confirmation No.'+transactionNo);
+                    mail.setplaintextbody('Payment was processed successfully.\nAmount is: '+pp.Amount__c+'\nPayment date is: ');
+                                          
+                    
+                    Messaging.EmailFileAttachment attach = new Messaging.EmailFileAttachment();
+                    
+                    String fileName=transactionNo+'.pdf';
+                    
+                    attach.setFileName(fileName);
+                    
+                    
+                    
+                    ContentVersion cv =[SELECT Id, Title, VersionData FROM ContentVersion WHERE Title =:fileName
+                                        
+                                        LIMIT 1];
+                    
+                    attach.setBody(cv.VersionData);
+                    
+                    mail.setFileAttachments(new Messaging.EmailFileAttachment[]{attach});
+                    
+                    
+                    
+                    mail.setToAddresses(address);
+                    emailList.add(mail);
+                    
+                    if(!emailList.isEmpty()){
+                        Messaging.sendEmail(emailList); 
+                    }
+                }
+            }
+        }	   
+    }
+}
